@@ -1,0 +1,1335 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Logs Parser</title>
+
+    <script src="https://unpkg.com/rxjs@^7/dist/bundles/rxjs.umd.min.js"></script>
+
+    <link href="https://unpkg.com/bootstrap@3.3.2/dist/css/bootstrap.min.css" rel="stylesheet"/>
+    <script src="https://unpkg.com/jquery@3.3.1/dist/jquery.min.js"></script>
+    <script src="https://unpkg.com/bootstrap@3.3.2/dist/js/bootstrap.min.js"></script>
+    <script src="https://unpkg.com/bootstrap-multiselect@0.9.13/dist/js/bootstrap-multiselect.js"></script>
+    <link href="https://unpkg.com/bootstrap-multiselect@0.9.13/dist/css/bootstrap-multiselect.css" rel="stylesheet"/>
+
+    <!-- MDC -->
+    <link href="https://unpkg.com/material-components-web@14.0.0/dist/material-components-web.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/material-components-web@14.0.0/dist/material-components-web.min.js"></script>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+
+    <!-- ag-Grid -->
+    <script src="https://cdn.jsdelivr.net/npm/ag-grid-community@29.0.0/dist/ag-grid-community.min.noStyle.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@29.0.0/styles/ag-grid.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@29.0.0/styles/ag-theme-balham.css">
+
+    <script>
+      async function loadMonaco() {
+        if (window._monacoLoaded) {
+          await window._monacoLoaded;
+          return;
+        } else {
+          let promiseRC;
+          window._monacoLoaded = new Promise((resolve, reject) => promiseRC = { resolve, reject });
+
+          try {
+            const monacoVersion = '0.36.1';
+            const monacoUrl = `https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/${monacoVersion}/min/vs`;
+
+            await new Promise(resolve => {
+              const loaderScript = document.createElement('script');
+              loaderScript.src = `${monacoUrl}/loader.min.js`;
+              loaderScript.onload = resolve;
+              document.head.appendChild(loaderScript);
+            });
+
+            // require is provided by loader.min.js
+            require.config({ paths: { 'vs': monacoUrl } });
+            await new Promise(resolve => require(['vs/editor/editor.main'], resolve));
+
+            promiseRC.resolve();
+          } catch (e) {
+            promiseRC.reject(e);
+            throw e;
+          }
+        }
+      }
+    </script>
+
+    <script>
+      class App {
+        /** @type {Notifier} */
+        static notifier;
+
+        /** @type {SingleResizeObserver} */
+        static singleResizeObserver;
+
+        /** @type {HTMLElement} */
+        displayedRowsInfoElement = document.getElementById('displayedRowsInfo');
+
+        /** @type {HTMLElement} */
+        clearFiltersBtnElement = document.getElementById('clearFiltersBtn');
+
+        /** @type {HTMLElement} */
+        gridElement = document.getElementById('grid');
+
+        /** @type {HTMLSelectElement} */
+        gridColumnsSelectElement = document.getElementById('gridColumnsSelect');
+        gridColumnsSelectJ = $('#gridColumnsSelect');
+
+        /** @type {object} */
+        gridOptions;
+
+        /** @type {StorageUtils} */
+        storage;
+
+        /** @type {{[key: string]: { config: LogsParser['parserConfig'] }}} */
+        static parsersConfigs = {
+          spark: {
+            config: {
+              mainRegex: /^(?<prop_date>[\d-]+ [\d:,.]+) (?<prop_severity>\w+)(?<tokens>.*)?$/s,
+              tokenRegex: / (?<token>\S+)=(?<value>\S*)/gs,
+              lastTokens: ['msg'],
+              pinned: 1,
+              tokenCallback: ({ token, value, mainMatch, tokenMatch }) => {
+                if (token === 'msg') {
+                  value = mainMatch.groups?.tokens.substring(tokenMatch.index + token.length + 2);
+                  return { value, type: 'string', stopTokensMatching: true };
+                }
+              }
+            }
+          },
+          awebLogger: {
+            config: {
+              mainRegex: /^(?<prop_date>[\d-]+T[\d:.]+(?:Z|[\d:]+)) (?<prop_severity>\w+)(?<tokens>.*)?$/s,
+              tokenRegex: / (?<token>[^\s"]+)="(?<value>(?:^[ \t][^\n]*$|.*?)*?)"(?=\s|$)/gsm,
+              pinned: 1,
+            }
+          }
+        }
+
+        logsParser = new LogsParser();
+
+        /** @type {DataLoader} */
+        dataLoader;
+
+        /** @type {ExtFilter} */
+        extFilter;
+
+        resized = new rxjs.Subject();
+        resizeObserver = new ResizeObserver(entries => entries.forEach(entry => this.resized.next(entry)));
+
+        /** @type boolean */
+        singleLineRows;
+
+        /** @type {DragDropHandler} */
+        dragDropHandler;
+
+        /** @type {LogWindow} */
+        logWindow;
+
+        constructor() {
+          this.initMdc();
+          App.notifier = App.notifier || new Notifier();
+          App.singleResizeObserver = App.singleResizeObserver || new SingleResizeObserver();
+          this.storage = new StorageUtils('logs-parser');
+        }
+
+        init() {
+          this.dataLoader = new DataLoader({ dataLoaded: ({ data, config }) => this.parse(data, config) });
+
+          this.extFilter = new ExtFilter();
+          this.extFilter.filterChange.pipe(rxjs.skip(1)).subscribe(value => {
+            this.gridOptions.api.onFilterChanged();
+          });
+
+          this.dragDropHandler = new DragDropHandler(document.body);
+          this.dragDropHandler.draggingOver$.subscribe(draggingOver => {
+            if (draggingOver && !this.dataLoader.isShown()) {
+              this.dataLoader.showDialog();
+            }
+          });
+
+          this.initGrid();
+          this.dataLoader.showDialog();
+        }
+
+        initGrid() {
+          this.gridColumnsSelectJ.multiselect({
+            includeSelectAllOption: true,
+            maxHeight: '--', // specified in style, but here some string need to be provided
+            buttonWidth: '200px',
+            onChange: () => this.syncColumnsVisibility(),
+            buttonText: (options, select) => {
+              if (options.length < select[0].options.length) {
+                app.gridColumnsSelectJ.addClass('grid-columns-select-warning');
+              } else {
+                app.gridColumnsSelectJ.removeClass('grid-columns-select-warning');
+              }
+              return `${options.length} / ${select[0].options.length} selected`;
+            },
+          });
+
+          this.gridOptions = {
+            defaultColDef: {
+              sortable: true,
+              resizable: true,
+              filterParams: { clearButton: true },
+              minWidth: 100,
+            },
+            columnDefs: [],
+            animateRows: true,
+            isExternalFilterPresent: () => !!this.extFilter.filterChange.value,
+            doesExternalFilterPass: (node) => this.extFilter.doesExternalFilterPass(node),
+            onCellFocused: (event) => {
+              this.showLogDetails({ onlyIfOpen: true });
+            },
+            onCellKeyDown: (event) => {
+              this.tryCopyToClipboard(event);
+            },
+            onRowDataUpdated: (event) => {
+              this.autoSizeColumns();
+            },
+            onFilterChanged: (event) => {
+              this.updateRowsCountInfo();
+            }
+          };
+
+          new agGrid.Grid(this.gridElement, this.gridOptions);
+          this.gridOptions.api.setRowData([]);
+        }
+
+        initMdc() {
+          mdc.autoInit();
+          // mdc.ripple.MDCRipple.attachTo(document.querySelector('.mdc-button'));
+        }
+
+        parse(data, config) {
+          this.logsParser.parserConfig = config;
+          this.logsParser.parse(data);
+
+
+          //TODO
+          const regexGuid = /[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}/i;
+          this.logsParser.logs
+            .filter(log => log.tokens.response_time)
+            .forEach(log => {
+              const mongoTokens = Object.keys(log.tokens)
+                .filter(i =>
+                    (i.startsWith('old_mongoCalls-') || i.startsWith('mongoCalls-'))
+                  //&& !i.includes('-trans')
+                  //&& !regexGuid.test(i)
+                )
+                .map(i => i.startsWith('old_mongoCalls-') ? i.substring(4) : i)
+                .filter((value, index, array) => array.indexOf(value) === index);
+              mongoTokens.forEach(mt => {
+                const diff = (log.tokens[mt] || 0) - (log.tokens[`old_${mt}`] || 0);
+                if (diff !== 0) {
+                  this.logsParser.setToken(log, 'token', `diff${mt.replace('mongoCalls', 'MC')}`, diff);
+                }
+              });
+
+              this.logsParser.tokensDefs.forEach((i, key) => {
+                if (i.name.startsWith('old_mongoCalls-') || i.name.startsWith('mongoCalls-')
+                  || i.name.startsWith('run_millis')
+                  || i.name.startsWith('proxyTime')
+                ) {
+                  this.logsParser.tokensDefs.delete(key);
+                }
+              });
+            });
+
+
+          this.prepareGridColumns();
+          this.setDataInGrid();
+
+          // hide columns previously hidden (according to value stored in local storage)
+          const hiddenCols = this.storage.read()?.hiddenCols || [];
+          if (hiddenCols.length) {
+            this.gridColumnsSelectJ.multiselect('selectAll').multiselect('deselect', hiddenCols);
+            this.syncColumnsVisibility();
+          }
+
+          if (!this.logsParser.logs.length) {
+            App.notifier.notify('No valid logs found.', 'warning');
+          }
+        }
+
+        prepareGridColumns() {
+          const newColumnsDef = this.prepareColumnsDef();
+          this.gridOptions.api.setColumnDefs(newColumnsDef);
+
+          this.gridColumnsSelectElement.innerHTML = this.gridOptions.columnApi.getColumns()
+            .map(c => `<option selected value="${c.getId()}">${c.colDef.headerName}</option>`)
+            .join('');
+          $('#gridColumnsSelect').multiselect('rebuild');
+        }
+
+        prepareColumnsDef() {
+          const kindOrders = { prop: 0, kind: 1 };
+
+          return [...this.logsParser.tokensDefs.values()]
+            .sort((a, b) => kindOrders[a.kind] - kindOrders[b.kind])
+            .map(tokenDef => {
+              const holdingObjName = `${tokenDef.kind}s${tokenDef.type === 'string' ? 'Org' : ''}`;
+              return {
+                headerName: tokenDef.name,
+                field: `${tokenDef.kind}:${tokenDef.name}`,
+                valueGetter: params => params.data[holdingObjName][tokenDef.name],
+                pinned: tokenDef.pinned,
+                filter: tokenDef.type === 'number' ? 'agNumberColumnFilter' : 'agTextColumnFilter',
+
+                ...(tokenDef.multiline && !this.singleLineRows ? {
+                  float: true,
+                  wrapText: true,
+                  autoHeight: true,
+                } : {}),
+              }
+            });
+        }
+
+        setDataInGrid() {
+          this.gridOptions.api.setRowData(this.logsParser.logs);
+          this.updateRowsCountInfo();
+        }
+
+        updateRowsCountInfo() {
+          const allCount = this.logsParser.logs?.length || 0;
+          const displayedCount = this.gridOptions.api.getDisplayedRowCount();
+
+          this.displayedRowsInfoElement.innerHTML = displayedCount < allCount
+            ? `Displayed logs count: <b>${displayedCount}</b> / <b>${allCount}</b>`
+            : `Logs count: <b>${allCount}</b>`;
+
+          this.clearFiltersBtnElement.style.display = this.hasAnyFilters() ? 'inline' : 'none';
+        }
+
+        hasAnyFilters() {
+          return Object.keys(this.gridOptions.api.getFilterModel() || {}).length > 0
+            || this.gridOptions.isExternalFilterPresent();
+        }
+
+        showLogDetails({ onlyIfOpen } = {}) {
+          if (!this.logWindow?.isOpen && onlyIfOpen) {
+            return;
+          }
+          this.logWindow = this.logWindow || new LogWindow();
+          const log = this.gridOptions.api.getDisplayedRowAtIndex(app.gridOptions.api.getFocusedCell()?.rowIndex)?.data;
+          this.logWindow.show(log);
+        }
+
+        //TODO not visible rows not refreshed
+        setSingleLineRows(singleLine) {
+          this.singleLineRows = singleLine;
+          if (this.logsParser.tokensDefs) {
+            this.prepareGridColumns();
+          }
+        }
+
+        clearAllFilters() {
+          this.gridOptions.api.setFilterModel(null);
+          this.extFilter.clear();
+        }
+
+        syncColumnsVisibility() {
+          const allIds = this.gridOptions.columnApi.getColumns().map(i => i.getId());
+          const toShow = this.gridColumnsSelectJ.val();
+          const toHide = allIds.filter(i => !toShow.includes(i));
+
+          this.gridOptions.columnApi.setColumnsVisible(toHide, false);
+          this.gridOptions.columnApi.setColumnsVisible(toShow, true);
+
+          const hiddenCols = this.storage.read()?.hiddenCols || [];
+          // preserve stored hiddenCols, which are not managed by this grid (i.e. stored earlier from different log files)
+          const hiddenColsToPreserve = hiddenCols.filter(i => !allIds.includes(i));
+          this.storage.store({ hiddenCols: [...hiddenColsToPreserve, ...toHide] });
+        }
+
+        sizeColumnsToFit() {
+          this.gridOptions.api.sizeColumnsToFit();
+        }
+
+        autoSizeColumns(skipHeader) {
+          this.gridOptions.api.sizeColumnsToFit();
+
+          this.gridOptions.defaultColDef.maxWidth = screen.width - 100;
+          this.gridOptions.api.setDefaultColDef(this.gridOptions.defaultColDef);
+          this.gridOptions.columnApi.autoSizeColumns(this.gridOptions.columnApi.getColumns().map(c => c.getId()), skipHeader);
+          this.gridOptions.defaultColDef.maxWidth = undefined;
+          this.gridOptions.api.setDefaultColDef(this.gridOptions.defaultColDef);
+        }
+
+        async tryCopyToClipboard(event) {
+          if (event.colDef.field && event.event.code === 'KeyC' && event.event.shiftKey && (event.event.ctrlKey || event.event.metaKey)) {
+            const log = event.data;
+            await ClipboardUtils.copy(JSON.stringify(log, null, 4));
+            this.gridOptions.api.flashCells({
+              rowNodes: [event.node],
+            });
+            App.notifier.notify('Row data copied to clipboard.');
+          } else if (event.colDef.field && event.event.code === 'KeyC' && (event.event.ctrlKey || event.event.metaKey)) {
+            const value = this.gridOptions.api.getValue(event.column, event.node);
+            await ClipboardUtils.copy(value);
+            this.gridOptions.api.flashCells({
+              columns: [event.column],
+              rowNodes: [event.node],
+            });
+            App.notifier.notify('Cell value copied to clipboard.');
+          }
+        }
+
+        getFormattedValue(column, rowNode) {
+          let value = myData.gridOptions.api.getValue(column, rowNode);
+          const colDef = column.getColDef();
+          if (colDef.valueFormatter) {
+            value = colDef.valueFormatter({
+              colDef: colDef,
+              data: rowNode.data,
+              api: this.grid.api,
+              column: column,
+              columnApi: this.grid.columnApi,
+              node: rowNode,
+              value: value,
+              context: null,
+            });
+          }
+          return value;
+        }
+      }
+
+      class ExtFilter {
+        /** @type {HTMLDialogElement} */
+        dialogElement = document.getElementById('extFilterDialog');
+
+        /** @type {HTMLElement} */
+        mainElement = this.dialogElement.querySelector('.main');
+
+        /** @type {HTMLElement} */
+        extFilterContainerElement = document.getElementById('extFilterContainer');
+
+        filterChange = new rxjs.BehaviorSubject(null);
+
+        /** @private */ cacheStorageKey = null;
+        /** @private */ monacoLoadPromise;
+        /** @private */ editor;
+        /** @private */ model;
+        /** @private */ func = Function('__expr__', 'return eval(__expr__)');
+        /** @private */ subs = [];
+
+        constructor() {
+          // load in background
+          this.monacoLoadPromise = loadMonaco().then(() => {
+            this.initEditor();
+          });
+        }
+
+        destroy() {
+          this.subs.forEach(i => i.unsubscribe());
+        }
+
+        initEditor() {
+          if (!this.editor) {
+            this.editor = monaco.editor.create(this.extFilterContainerElement, {
+              language: 'javascript',
+              fontSize: 12,
+              value: '',
+            });
+            this.model = this.editor.getModel();
+
+            this.subs.push(
+              App.singleResizeObserver.observe(this.extFilterContainerElement, () => this.editor.layout())
+            );
+          }
+        }
+
+        async showDialog() {
+          await this.monacoLoadPromise;
+
+          this.dialogElement.showModal();
+          this.editor.layout();
+
+          this.valueSnapshot = this.model.getValue();
+        }
+
+        doesExternalFilterPass(node) {
+          if (node.data && this.filterChange.value) {
+            try {
+              return this.func.call(node.data, this.filterChange.value);
+            } catch (err) {
+              App.notifier.notify('Error in custom filtering code.', 'error');
+              HistoryCache.delete(this.cacheStorageKey, this.filterChange.value);
+            }
+          }
+          return true;
+        }
+
+        history() {
+          const data = HistoryCache.read(this.cacheStorageKey);
+          const lastItem = data?.items[0];
+          if (lastItem) {
+            this.model.setValue(lastItem.value);
+          }
+        }
+
+        clear() {
+          const value = '';
+          this.model.setValue(value);
+          this.filterChange.next(value);
+        }
+
+        ok() {
+          const value = this.model.getValue()?.trim();
+          this.filterChange.next(value);
+          HistoryCache.store(this.cacheStorageKey, value, 10);
+          this.dialogElement.close();
+        }
+
+        cancel() {
+          this.dialogElement.close();
+          this.model.setValue(this.valueSnapshot);
+        }
+      }
+
+      class LogsParser {
+        /** @type {{ index: number, lineNr: number, linesCnt: number, parsed: boolean, raw: string, props: object, tokens: object }[]} */
+        logs;
+
+        /** @type {Map<string, { kind: 'prop'|'token', name: string, type: string, multiline?: boolean, pinned?: boolean }>} */
+        tokensDefs;
+
+        /** @type {{
+         * mainRegex: RegExp|string,
+         * mainRegexFlags?: string,
+         * tokenRegex: RegExp|string,
+         * tokenRegexFlags?: string,
+         * tokenCallback?: ({ token: string, value: string, raw: string, mainMatch: RegExpMatchArray, tokenMatch: RegExpMatchArray }) =>
+         *   { value: string, token?: string, type?: string, stopTokensMatching?: boolean, order?: number },
+         * lastTokens?: string[],
+         * pinned?: number,
+         * }}*/
+        parserConfig;
+
+        /**
+         * @param {LogsParser['parserConfig']} [parserConfig]
+         */
+        constructor(parserConfig) {
+          this.parserConfig = parserConfig;
+        }
+
+        parse(data) {
+          this.logs = [];
+          this.tokensDefs = new Map();
+
+          if (!(typeof data === 'string' && data.length)) {
+            return;
+          }
+
+          const mainRegex = this.parserConfig.mainRegex instanceof RegExp
+            ? this.parserConfig.mainRegex
+            : new RegExp(this.parserConfig.mainRegex, this.parserConfig.mainRegexFlags);
+
+          let tokenRegex;
+          if (this.parserConfig.tokenRegex instanceof RegExp) {
+            tokenRegex = this.parserConfig.tokenRegex;
+          } else {
+            let flags = this.parserConfig.tokenRegexFlags || '';
+            if (!flags.includes('g')) {
+              flags += 'g';
+            }
+            tokenRegex = new RegExp(this.parserConfig.tokenRegex, flags);
+          }
+
+          data.split(/[\r\n]+/).forEach((line, lineNr) => {
+            const mainMatch = line.match(mainRegex);
+            if (mainMatch) {
+              this.logs.push({
+                index: this.logs.length,
+                lineNr,
+                linesCnt: 1,
+                parsed: true,
+                raw: line,
+                props: {},
+                propsOrg: {},
+                tokens: {},
+                tokensOrg: {},
+              });
+            } else if (this.logs.length) {
+              const lastLog = this.logs[this.logs.length - 1];
+              lastLog.linesCnt++;
+              lastLog.raw += `\n${line}`;
+            }
+          });
+
+          this.logs.forEach(log => {
+            const mainMatch = log.raw.match(mainRegex);
+            if (mainMatch) {
+              const mainMatchPropPrefix = 'prop_';
+              Object.keys(mainMatch.groups || {}).filter(key => key.startsWith(mainMatchPropPrefix)).forEach(key => {
+                this.setToken(log, 'prop', key.substring(mainMatchPropPrefix.length), mainMatch.groups[key]);
+              });
+
+              const rest = mainMatch.groups?.tokens;
+              if (rest) {
+                const tokensMatches = [...(rest.matchAll(tokenRegex) || [])];
+                for (const tokenMatch of tokensMatches) {
+                  let token = tokenMatch.groups?.token;
+                  let value = tokenMatch.groups?.value;
+                  let tokenType;
+
+                  const cbResult = this.parserConfig.tokenCallback?.({ token, value, raw: log.raw, mainMatch, tokenMatch });
+                  if (cbResult) {
+                    value = cbResult.value;
+                    token = cbResult.token || token;
+                    tokenType = cbResult.type;
+                  }
+                  this.setToken(log, 'token', token, value, { suggestedType: tokenType });
+
+                  if (cbResult?.stopTokensMatching) {
+                    break;
+                  }
+                }
+              }
+            }
+          });
+
+          this.orderTokens();
+        }
+
+        /**
+         * @param log
+         * @param {'prop'|'token'} kind
+         * @param {string} name
+         * @param {any} value
+         * @param {string} [suggestedType]
+         * @param {boolean} [multiline]
+         */
+        setToken(log, kind, name, value, { suggestedType, multiline } = {}) {
+          if (!name || (kind !== 'prop' && kind !== 'token')) {
+            return;
+          }
+          const key = `${kind}_${name}`;
+
+          if (!this.tokensDefs.has(key)) {
+            this.tokensDefs.set(key, { kind, name, type: undefined });
+          }
+          const tokenDef = this.tokensDefs.get(key);
+
+          const parsed = this.parseValue(value, suggestedType);
+
+          if (tokenDef.type !== 'string') {
+            if (!tokenDef.type) {
+              tokenDef.type = parsed.type;
+            } else if (tokenDef.type !== parsed.type) {
+              tokenDef.type = 'string';
+            }
+          }
+
+          if (!tokenDef.multiline && tokenDef.type === 'string' && typeof parsed.value === 'string' && parsed.value.includes('\n')) {
+            tokenDef.multiline = true;
+          }
+
+          log[`${kind}s`][name] = parsed.value;
+          log[`${kind}sOrg`][name] = value;
+        }
+
+        parseValue(value, suggestedType) {
+          if (typeof value === 'string' && (!suggestedType || suggestedType === 'number') && value.trim().match(/^\d+(\.\d+)?$/)) {
+            try {
+              return { type: 'number', value: Number(value) };
+            } catch (e) {
+            }
+          }
+          return { type: 'string', value };
+        }
+
+        orderTokens() {
+          this.parserConfig.lastTokens?.forEach(tokenName => {
+            const key = `token_${tokenName}`;
+            if (this.tokensDefs.has(key)) {
+              const lastToken = this.tokensDefs.get(key);
+              this.tokensDefs.delete(key);
+              this.tokensDefs.set(key, lastToken);
+            }
+          });
+
+          [...this.tokensDefs.values()].forEach((token, i) => {
+            token.pinned = this.parserConfig.pinned && i < this.parserConfig.pinned;
+          });
+        }
+      }
+
+      class DataLoader {
+        /** @type {HTMLDialogElement} */
+        dialogElement = document.getElementById('loadDialog');
+
+        /** @type {HTMLElement} */
+        mainElement = this.dialogElement.querySelector('.main');
+
+        /** @type {HTMLFormElement} */
+        form = this.dialogElement.getElementsByTagName('form')[0];
+
+        /** @type {({ data: string, config: object }) => void} */
+        dataLoaded;
+
+        /** @type {DragDropHandler} */
+        dragDropHandler = new DragDropHandler(this.mainElement);
+
+        constructor(options) {
+          this.dataLoaded = options?.dataLoaded;
+
+          this.dragDropHandler.draggingOver$.subscribe(draggingOver => this.mainElement.setAttribute('data-drag-over', !!draggingOver));
+          this.dragDropHandler.filesDropped$.subscribe(files => this.loadFile(files[0]));
+        }
+
+        showDialog() {
+          this.reset();
+          this.dialogElement.showModal();
+        }
+
+        isShown() {
+          return this.dialogElement.open;
+        }
+
+        reset() {
+          const logType = this.form.logType.value;
+          this.form.reset();
+          this.form.logType.value = logType;
+        }
+
+        /**
+         * @param {File} file
+         */
+        async loadFile(file) {
+          if (file) {
+            this.lastSource = { kind: 'file', file };
+            const data = await file.text();
+            this.load(data);
+          }
+        }
+
+        loadText(text) {
+          this.lastSource = { kind: 'text', text };
+          this.load(text);
+        }
+
+        load(text) {
+          const config = App.parsersConfigs[this.form.logType.value].config;
+          this.dataLoaded?.({ data: text, config });
+          this.dialogElement.close();
+        }
+      }
+
+      class DragDropHandler {
+        /** @type {HTMLElement} */
+        element;
+
+        /** @type {boolean} */
+        multiple;
+
+        /** @type {boolean} */
+        disabled;
+
+        /** @private */
+        _draggingOverSub = new rxjs.BehaviorSubject(false);
+
+        /** @type {rxjs.Observable<boolean>} */
+        draggingOver$;
+
+        /** @private */
+        _filesDroppedSub = new rxjs.BehaviorSubject(false);
+
+        /** @type {rxjs.Observable<boolean>} */
+        filesDropped$;
+
+        /**
+         * @param {HTMLElement} element
+         */
+        constructor(element) {
+          this.element = element;
+          this.addHandlers();
+
+          this.draggingOver$ = this._draggingOverSub.pipe(
+            rxjs.operators.switchMap(draggingOver => draggingOver
+              ? rxjs.of(true)
+              : rxjs.timer(100).pipe(
+                rxjs.operators.map(() => false)
+              )
+            ),
+            rxjs.operators.distinctUntilChanged(),
+          );
+
+          this.filesDropped$ = this._filesDroppedSub.asObservable();
+        }
+
+        /**
+         * @private
+         */
+        addHandlers() {
+          this.element.addEventListener('dragenter', (event) => this.handleEvent(event, true));
+          this.element.addEventListener('dragover', (event) => this.handleEvent(event, true));
+          this.element.addEventListener('dragleave', (event) => this.handleEvent(event, false));
+          this.element.addEventListener('drop', (event) => {
+            if (this.handleEvent(event, false)) {
+              this.handleDroppedFiles(event.dataTransfer?.files);
+            }
+          });
+        }
+
+        /**
+         * @private
+         * @param {DragEvent} event
+         * @param {boolean} draggingOver
+         * @return {boolean} whether event was a correctly handled
+         */
+        handleEvent(event, draggingOver) {
+          if (!this.disabled && this.isDraggingFiles(event)) {
+            event.preventDefault();
+            event.stopPropagation();
+            this._draggingOverSub.next(draggingOver);
+            return true;
+          }
+
+          return false;
+        }
+
+        /**
+         * @param {DragEvent} event
+         */
+        isDraggingFiles(event) {
+          return event.dataTransfer?.types.includes('Files');
+        }
+
+        /**
+         * @private
+         * @param {FileList} fileList
+         */
+        handleDroppedFiles(fileList) {
+          if (fileList?.length) {
+            if (!this.multiple && fileList.length > 1) {
+              App.notifier.notify('Drag and drop only one file.', 'warning');
+            } else {
+              this._filesDroppedSub.next([...fileList]);
+            }
+          }
+        }
+      }
+
+      class ClipboardUtils {
+        static async copy(text) {
+          if (navigator['clipboard']) {
+            return navigator['clipboard'].writeText(text);
+          } else {
+            return this.copyFallback(text);
+          }
+        }
+
+        static async copyFallback(text) {
+          const tempElement = document.createElement('textarea');
+          tempElement.style.cssText = `
+                  width: 1px !important;
+                  height: 1px !important;
+                  position: absolute !important;
+                  top: -10px !important;
+                  opacity: 0 !important;
+                  margin: 0 !important;
+                  padding: 0;
+                  border: none;
+                  outline: none;
+                  boxShadow: none;
+                  background: transparent;`;
+          tempElement.value = text;
+          document.body.appendChild(tempElement);
+
+          try {
+            tempElement.focus();
+            tempElement.select();
+
+            const successful = document.execCommand('copy');
+            if (!successful) {
+              throw new Error('Copying to clipboard was unsuccessful.');
+            }
+          } finally {
+            document.body.removeChild(tempElement);
+          }
+        }
+      }
+
+      class Notifier {
+        /** @type {HTMLElement} */
+        snackbarElement = document.querySelector('.mdc-snackbar');
+
+        snackbar = new mdc.snackbar.MDCSnackbar(this.snackbarElement);
+
+        /**
+         *
+         * @param {string} text
+         * @param {'error'|'warning'} [severity]
+         */
+        notify(text, severity) {
+          this.snackbar.close();
+          this.snackbar.labelText = text;
+          this.snackbarElement.setAttribute('data-severity', severity || '');
+          this.snackbar.open();
+        }
+      }
+
+      class SingleResizeObserver {
+        /** @type {Map<string, {elementRef: WeakRef, observers: any[]}>} */
+        map = new Map();
+        attrName = 'data-resizeItem-id';
+        static seq = 1;
+
+        /** @type {ResizeObserver} */
+        resizeObserver;
+
+        constructor() {
+          this.resizeObserver = new ResizeObserver(entries => entries.forEach(entry => this.resized(entry)));
+        }
+
+        destroy() {
+          this.map.forEach(value => value.observers.forEach(observer => observer.complete()));
+          this.map.clear();
+          this.resizeObserver.disconnect();
+        }
+
+        resized(entry) {
+          const target = entry.target;
+          const mapItem = this.map.get(target.getAttribute(this.attrName));
+          if (mapItem) {
+            mapItem.observers.forEach(o => o.next(entry));
+          } else {
+            this.resizeObserver.unobserve(target);
+
+            this.map.forEach((value, id) => {
+              const element = value.elementRef.deref();
+              if (!element) {
+                value.observers.forEach(observer => observer.complete());
+              }
+              this.map.delete(id);
+            });
+          }
+        }
+
+        /**
+         * @param {HTMLElement} target
+         * @param {Function} callback
+         * @param {any} [options]
+         */
+        observe(target, callback, options) {
+          let id;
+          if (target.hasAttribute(this.attrName)) {
+            id = target.getAttribute(this.attrName);
+          } else {
+            id = `${SingleResizeObserver.seq++}`;
+            target.setAttribute(this.attrName, id);
+          }
+
+          let mapEntry;
+          if (this.map.has(id)) {
+            mapEntry = this.map.get(id);
+          } else {
+            mapEntry = {
+              elementRef: new WeakRef(target),
+              observers: new Set(),
+            };
+            this.map.set(id, mapEntry);
+          }
+
+          const obs = new rxjs.Observable((observer) => {
+            mapEntry.observers.add(observer);
+
+            this.resizeObserver.observe(target, options);
+            return () => {
+              this.resizeObserver.unobserve(target);
+
+              observer.complete();
+              mapEntry.observers.delete(observer);
+              if (!mapEntry.observers.size) {
+                this.map.delete(id);
+              }
+            }
+          })
+          return obs.subscribe((entry) => callback(entry));
+        }
+      }
+
+      class StorageUtils {
+        constructor(key) {
+          this.key = key;
+          this.storage = localStorage;
+        }
+
+        read() {
+          if (!this.key) {
+            return {};
+          }
+          try {
+            return JSON.parse(this.storage.getItem(this.key));
+          } catch (e) {
+            return undefined;
+          }
+        }
+
+        store(objToMerge) {
+          if (!this.key) {
+            return { objToMerge };
+          }
+          let data = this.read(this.key) || {};
+          data = {
+            ...data,
+            ...objToMerge,
+          }
+
+          try {
+            this.storage.setItem(this.key, JSON.stringify(data));
+            return data;
+          } catch (e) {
+            return undefined;
+          }
+        }
+      }
+
+      class HistoryCache {
+        /**
+         * @param storageKey
+         * @return {{maxCount: number, items: {date: string, value: any}[]}}
+         */
+        static read(storageKey) {
+          if (!storageKey) {
+            return undefined;
+          }
+          try {
+            return JSON.parse(localStorage.getItem(storageKey));
+          } catch (e) {
+            return undefined;
+          }
+        }
+
+        static store(storageKey, value, maxCount) {
+          if (!storageKey) {
+            return undefined;
+          }
+          const data = HistoryCache.read(storageKey) || { items: [], maxCount };
+
+          data.maxCount = maxCount || data.maxCount;
+          data.items = data.items.filter(i => i.value !== value);
+          data.items.splice(0, 0, { value, date: new Date().toISOString() });
+          if (data.items.length > maxCount) {
+            data.items = data.items.slice(0, maxCount);
+          }
+
+          try {
+            localStorage.setItem(storageKey, JSON.stringify(data));
+            return data;
+          } catch (e) {
+            return undefined;
+          }
+        }
+
+        static delete(storageKey, value) {
+          const data = HistoryCache.read(storageKey);
+          if (data) {
+            data.items = data.items.filter(i => i.value !== value);
+
+            try {
+              localStorage.setItem(storageKey, JSON.stringify(data));
+              return data;
+            } catch (e) {
+            }
+          }
+          return undefined;
+        }
+      }
+
+      class PopupWindow {
+        /** @private
+         * @type {Window}
+         */
+        popupWindow;
+
+        get isOpen() {
+          return this.popupWindow && !this.popupWindow.closed;
+        }
+
+        constructor() {
+          this.initAutoDestroy();
+        }
+
+        destroy() {
+          this.popupWindow?.close();
+          this.popupWindow = null;
+        }
+
+        open(html) {
+          if (!this.isOpen) {
+            this.popupWindow = window.open('', '',
+              `width=${Math.max(Math.floor(window.screen.width / 2), 800)},height=${Math.floor(window.screen.height / 2)}`);
+
+            this.popupWindow.onbeforeunload = () => this.destroy();
+            this.popupWindow.onunload = () => this.destroy();
+          }
+
+          if (html != null) {
+            this.popupWindow.document.open();
+            this.popupWindow.document.write(html);
+            this.popupWindow.document.close();
+          }
+        }
+
+        initAutoDestroy() {
+          window.addEventListener('beforeunload', () => this.destroy());
+          window.addEventListener('unload', () => this.destroy());
+        }
+      }
+
+      class LogWindow extends PopupWindow {
+        show(log) {
+          let json = '';
+          if (log) {
+            try {
+              json = JSON.stringify(log, null, 4);
+            } catch (e) {
+            }
+          }
+          this.open(`<pre>${json}</pre>`);
+        }
+      }
+
+      function onLoad() {
+        window.app = new App();
+        window.app.init();
+      }
+    </script>
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html {
+            font-family: Roboto, Arial, Helvetica, sans-serif;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            padding: 0.5em;
+        }
+
+        body > * {
+            flex: none;
+        }
+
+        label {
+            font-weight: unset;
+        }
+
+        .header-row {
+            display: flex;
+            align-items: center;
+            font-size: 13px;
+        }
+
+        .header-row > * {
+            flex: none;
+        }
+
+        .header-row > * + * {
+            margin-left: 2em;
+        }
+
+        .flex-spacer {
+            flex: auto;
+        }
+
+        ul.multiselect-container.dropdown-menu {
+            max-height: calc(100vh - 100px);
+        }
+
+        .grid-columns-select-warning ~ .btn-group .multiselect {
+            background-color: #fff4e0;
+            border-color: #d38800;
+        }
+
+        .separator {
+            align-self: stretch;
+            margin: 0.25em 3em;
+            border-left: 1px solid lightgray;
+        }
+
+        .horizontal-separator {
+            align-self: stretch;
+            margin: 1em 0;
+            border-top: 1px solid lightgray;
+        }
+
+        .horizontal-separator-textual {
+            display: flex;
+            align-items: center;
+            margin: 1em 0;
+        }
+
+        .horizontal-separator-textual::before, .horizontal-separator-textual::after {
+            content: '';
+            border-top: 1px solid lightgray;
+            width: 0;
+            height: 0;
+            flex: auto;
+            margin: 0 0.5em;
+        }
+
+        #grid {
+            margin-top: 1em;
+            flex: 1 0 auto;
+            height: 120px;
+        }
+
+        .ag-cell-wrap-text {
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .ag-cell-wrap-text.ag-cell-value, .ag-cell-wrap-text .ag-cell-value {
+            line-height: 1.5em;
+            padding: 3px;
+        }
+
+        .ag-cell-auto-height.ag-cell-wrapper, .ag-cell-auto-height .ag-cell-wrapper {
+            max-height: 10em;
+            overflow-y: auto;
+            align-items: flex-start;
+        }
+
+        dialog {
+            font-size: 13px;
+            border: 1px solid lightgray;
+            border-radius: 4px;
+            padding: 0;
+        }
+
+        dialog > .main {
+            padding: 1em;
+        }
+
+        dialog section {
+            min-height: 4em;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        dialog .actions {
+            text-align: end;
+        }
+
+        .drop-area {
+            border: 2px dashed transparent;
+        }
+
+        .drop-area[data-drag-over=true] {
+            border-color: #00db00;
+            background-color: #00800014;
+        }
+
+        .mdc-snackbar[data-severity=warning] .mdc-snackbar__label {
+            color: #ff9900;
+        }
+
+        .mdc-snackbar[data-severity=error] .mdc-snackbar__label {
+            color: #ff6d6d;
+        }
+    </style>
+</head>
+<body onload="onLoad()">
+<div class="header-row">
+    <button onclick="app.dataLoader.showDialog()">Load data...</button>
+    <button onclick="app.showLogDetails()">Selected log details...</button>
+
+    <div class="flex-spacer"></div>
+
+    <span id="displayedRowsInfo"></span>
+    <div>
+        <button id="extFilterBtn" onclick="app.extFilter.showDialog()">Custom filter</button>
+        <button id="clearFiltersBtn" onclick="app.clearAllFilters()">Clear all filters</button>
+    </div>
+
+    <div class="separator"></div>
+
+    <span>
+        <input id="singleLineRowsChb" type="checkbox" onchange="app.setSingleLineRows(this.checked)" />
+        <label for="singleLineRowsChb">Single-line rows</label>
+    </span>
+
+    <div>
+        <span>Show Columns:</span>
+        <select id="gridColumnsSelect" multiple class="form-select"></select>
+    </div>
+
+    <div>
+        Size columns:
+        <button title="Fit to Window" onclick="app.sizeColumnsToFit()">Fit</button>
+        <button title="Auto-Size" onclick="app.autoSizeColumns()">Auto</button>
+        <button title="Auto-Size (skip headers)" onclick="app.autoSizeColumns(true)">Auto2</button>
+    </div>
+
+</div>
+<div id="grid" class="ag-theme-balham"></div>
+
+<dialog id="loadDialog" class="mdc-elevation--z24" style="width: 35em;">
+    <div class="main drop-area">
+        <h3 style="text-align: center;">Load data</h3>
+        <p>Load data containing spark logs.</p>
+        <form id="loadForm" method="dialog" style="border-bottom: 1px solid lightgray; padding: 1em 0;">
+            Logs type: <select name="logType">
+                <option>awebLogger</option>
+                <option>spark</option>
+            </select>
+            <div class="horizontal-separator"></div>
+            <section>
+                <input type="file" onchange="app.dataLoader.loadFile(this.files?.[0])" />
+            </section>
+            <div class="horizontal-separator-textual">OR</div>
+            <section>
+                <div style="flex: auto; display: flex; flex-direction: column; align-items: end;">
+                    <textarea id="textBox" rows="3" style="width: 100%;" placeholder="paste some text here"></textarea>
+                    <button type="button" style="margin-top: 0.5em;" onclick="app.dataLoader.loadText(document.getElementById('textBox').value)">Parse</button>
+                </div>
+            </section>
+            <div class="horizontal-separator-textual">OR</div>
+            <section>
+                <div style="color: gray;">Just drag-n-drop some file here.</div>
+            </section>
+        </form>
+        <div class="actions" style="margin-top: 1em; text-align: end;">
+            <button onclick="app.dataLoader.dialogElement.close()">Cancel</button>
+        </div>
+    </div>
+</dialog>
+
+<dialog id="extFilterDialog" class="mdc-elevation--z24" style=" width: 60vw; height: 30em; resize: both;">
+    <div class="main" style="height: 100%; display: flex; flex-direction: column;">
+        <h3 style="text-align: center;">Custom filter logic</h3>
+        <p>Provide predicate for logs filtering. "this" keyword represent single log details, the object that is shown after pressing the "Selected log details..." button.<br/>
+        The example of custom filter function:</p>
+        <pre>this.tokens.action?.match(/ab[0-9]/) && this.props.severity === 'ERROR'</pre>
+        <div id="extFilterContainer" style="flex: auto; height: 5em; border: 1px solid lightgray;"></div>
+        <div class="actions" style="margin-top: 1em; text-align: end;">
+            <!-- <button onclick="app.extFilter.history()" style="float: left;">TODO last</button> -->
+            <button onclick="app.extFilter.ok()">Filter</button>
+            <button onclick="app.extFilter.cancel()">Cancel</button>
+        </div>
+    </div>
+</dialog>
+
+<aside class="mdc-snackbar">
+    <div class="mdc-snackbar__surface" role="status" aria-relevant="additions">
+        <div class="mdc-snackbar__label" style="font-size: 14px" aria-atomic="false"></div>
+    </div>
+</aside>
+</body>
+</html>
